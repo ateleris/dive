@@ -2,13 +2,14 @@ package docker
 
 import (
 	"fmt"
-	"github.com/spf13/afero"
-	"github.com/wagoodman/dive/internal/bus/event/payload"
-	"github.com/wagoodman/dive/internal/log"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/spf13/afero"
+	"github.com/wagoodman/dive/internal/bus/event/payload"
+	"github.com/wagoodman/dive/internal/log"
 
 	cliconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/cli/cli/connhelper"
@@ -39,6 +40,28 @@ func (r *engineResolver) Fetch(ctx context.Context, id string) (*image.Image, er
 	defer reader.Close()
 
 	img, err := NewImageArchive(reader)
+	if err == nil {
+		return img.ToImage(id)
+	}
+
+	if !strings.Contains(err.Error(), "could not find image config") {
+		return nil, err
+	}
+
+	log.Infof("incomplete archive detected; fetching missing blobs from registry for %q", id)
+
+	fetcher, fetcherErr := newRegistryBlobFetcher(id)
+	if fetcherErr != nil {
+		return nil, fmt.Errorf("%w\n\nhint: the archive from Docker appears incomplete (common with Docker Desktop's containerd image store).\n      tried to fetch missing blobs from the registry but failed: %v\n      workaround: set \"containerd-snapshotter\": false in Docker Desktop Engine config and restart", err, fetcherErr)
+	}
+
+	reader2, err2 := r.fetchArchive(ctx, id)
+	if err2 != nil {
+		return nil, fmt.Errorf("could not re-fetch archive for retry: %w", err2)
+	}
+	defer reader2.Close()
+
+	img, err = NewImageArchive(reader2, fetcher)
 	if err != nil {
 		return nil, err
 	}
@@ -59,11 +82,30 @@ func (r *engineResolver) Extract(ctx context.Context, id string, l string, p str
 		return err
 	}
 
-	if err := ExtractFromImage(io.NopCloser(reader), l, p); err == nil {
+	extractErr := ExtractFromImage(io.NopCloser(reader), l, p)
+	reader.Close()
+	if extractErr == nil {
 		return nil
 	}
 
-	return fmt.Errorf("unable to extract from image '%s': %+v", id, err)
+	if extractErr != ErrLayerNotFoundInArchive {
+		return fmt.Errorf("unable to extract from image '%s': %w", id, extractErr)
+	}
+
+	// Layer not in archive — fetch from registry (Docker Desktop containerd workaround)
+	fetcher, err := newRegistryBlobFetcher(id)
+	if err != nil {
+		return fmt.Errorf("unable to extract from image '%s': layer not in archive and registry fallback failed: %w", id, err)
+	}
+
+	digest := blobPathToDigest(l)
+	blobReader, err := fetcher(digest)
+	if err != nil {
+		return fmt.Errorf("unable to fetch layer %s from registry: %w", l, err)
+	}
+	defer blobReader.Close()
+
+	return ExtractFromCompressedBlob(blobReader, p)
 }
 
 func (r *engineResolver) fetchArchive(ctx context.Context, id string) (io.ReadCloser, error) {

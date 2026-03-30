@@ -18,13 +18,20 @@ import (
 	"github.com/wagoodman/dive/dive/image"
 )
 
+type BlobFetcher func(digest string) (io.ReadCloser, error)
+
 type ImageArchive struct {
 	manifest manifest
 	config   config
 	layerMap map[string]*filetree.FileTree
 }
 
-func NewImageArchive(tarFile io.ReadCloser) (*ImageArchive, error) {
+func NewImageArchive(tarFile io.ReadCloser, fetchers ...BlobFetcher) (*ImageArchive, error) {
+	var fetcher BlobFetcher
+	if len(fetchers) > 0 {
+		fetcher = fetchers[0]
+	}
+
 	img := &ImageArchive{
 		layerMap: make(map[string]*filetree.FileTree),
 	}
@@ -188,13 +195,73 @@ func NewImageArchive(tarFile io.ReadCloser) (*ImageArchive, error) {
 	}
 
 	configContent, exists := jsonFiles[img.manifest.ConfigPath]
+	if !exists && fetcher != nil {
+		digest := blobPathToDigest(img.manifest.ConfigPath)
+		reader, err := fetcher(digest)
+		if err == nil {
+			data, readErr := io.ReadAll(reader)
+			reader.Close()
+			if readErr == nil {
+				configContent = data
+				exists = true
+			}
+		}
+	}
 	if !exists {
 		return img, fmt.Errorf("could not find image config")
 	}
 
 	img.config = newConfig(configContent)
 
+	if fetcher != nil {
+		for _, layerPath := range img.manifest.LayerTarPaths {
+			if _, ok := img.layerMap[layerPath]; !ok {
+				digest := blobPathToDigest(layerPath)
+				reader, err := fetcher(digest)
+				if err != nil {
+					return img, fmt.Errorf("could not fetch layer %s: %w", layerPath, err)
+				}
+				tree, err := processLayerBlob(layerPath, reader)
+				reader.Close()
+				if err != nil {
+					return img, fmt.Errorf("could not process layer %s: %w", layerPath, err)
+				}
+				img.layerMap[layerPath] = tree
+			}
+		}
+	}
+
 	return img, nil
+}
+
+func processLayerBlob(name string, reader io.Reader) (*filetree.FileTree, error) {
+	buffer := make([]byte, 1024)
+	n, err := io.ReadFull(reader, buffer)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+
+	makeReader := func() io.Reader {
+		return io.MultiReader(bytes.NewReader(buffer[:n]), reader)
+	}
+
+	if gz, err := gzip.NewReader(makeReader()); err == nil {
+		if tree, err := processLayerTar(name, tar.NewReader(gz)); err == nil {
+			return tree, nil
+		}
+	}
+
+	if zr, err := zstd.NewReader(makeReader()); err == nil {
+		if tree, err := processLayerTar(name, tar.NewReader(zr)); err == nil {
+			return tree, nil
+		}
+	}
+
+	if tree, err := processLayerTar(name, tar.NewReader(makeReader())); err == nil {
+		return tree, nil
+	}
+
+	return nil, fmt.Errorf("unrecognized layer format")
 }
 
 func processLayerTar(name string, reader *tar.Reader) (*filetree.FileTree, error) {
@@ -300,6 +367,8 @@ func (img *ImageArchive) ToImage(id string) (*image.Image, error) {
 	}, nil
 }
 
+var ErrLayerNotFoundInArchive = fmt.Errorf("layer not found in archive")
+
 func ExtractFromImage(tarFile io.ReadCloser, l string, p string) error {
 	tarReader := tar.NewReader(tarFile)
 
@@ -331,7 +400,29 @@ func ExtractFromImage(tarFile io.ReadCloser, l string, p string) error {
 		}
 	}
 
-	return nil
+	return ErrLayerNotFoundInArchive
+}
+
+func ExtractFromCompressedBlob(reader io.Reader, p string) error {
+	buffer := make([]byte, 1024)
+	n, err := io.ReadFull(reader, buffer)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return err
+	}
+
+	makeReader := func() io.Reader {
+		return io.MultiReader(bytes.NewReader(buffer[:n]), reader)
+	}
+
+	if gz, err := gzip.NewReader(makeReader()); err == nil {
+		return extractInner(tar.NewReader(gz), p)
+	}
+
+	if zr, err := zstd.NewReader(makeReader()); err == nil {
+		return extractInner(tar.NewReader(zr), p)
+	}
+
+	return extractInner(tar.NewReader(makeReader()), p)
 }
 
 func extractInner(reader *tar.Reader, p string) error {
